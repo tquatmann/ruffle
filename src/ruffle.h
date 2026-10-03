@@ -480,8 +480,66 @@ class LearningHelper {
     }
 
     /*!
+     * Converts a single reward value to the output value type. For interval output types, every reward
+     * becomes a point interval [r, r], i.e., the rewards are exact and not made uncertain.
+     */
+    template<typename OutputValueType>
+    static OutputValueType convertReward(ValueType const& reward) {
+        if constexpr (std::is_same_v<OutputValueType, ValueType>) {
+            return reward;
+        } else {
+            auto const point = storm::utility::convertNumber<storm::IntervalBaseType<OutputValueType>>(reward);
+            return OutputValueType(point, point);
+        }
+    }
+
+    /*!
+     * Converts a reward model to the output value type. Rewards of interval models are point intervals.
+     */
+    template<typename OutputValueType>
+    static storm::models::sparse::StandardRewardModel<OutputValueType> convertRewardModel(
+        storm::models::sparse::StandardRewardModel<ValueType> const& rewardModel, bool isDeterministicModel) {
+        auto convertVector = [](std::vector<ValueType> const& values) {
+            std::vector<OutputValueType> result;
+            result.reserve(values.size());
+            for (auto const& value : values) {
+                result.push_back(convertReward<OutputValueType>(value));
+            }
+            return result;
+        };
+
+        std::optional<std::vector<OutputValueType>> stateRewards;
+        if (rewardModel.hasStateRewards()) {
+            stateRewards = convertVector(rewardModel.getStateRewardVector());
+        }
+        std::optional<std::vector<OutputValueType>> stateActionRewards;
+        if (rewardModel.hasStateActionRewards()) {
+            stateActionRewards = convertVector(rewardModel.getStateActionRewardVector());
+        }
+        std::optional<storm::storage::SparseMatrix<OutputValueType>> transitionRewards;
+        if (rewardModel.hasTransitionRewards()) {
+            auto const& oldMatrix = rewardModel.getTransitionRewardMatrix();
+            auto builder = createMatrixBuilder<OutputValueType>(oldMatrix, isDeterministicModel);
+            auto const& groupIndices = oldMatrix.getRowGroupIndices();
+            for (std::size_t group = 0; group < oldMatrix.getRowGroupCount(); ++group) {
+                if (!isDeterministicModel) {
+                    builder.newRowGroup(groupIndices[group]);
+                }
+                for (auto row = groupIndices[group]; row < groupIndices[group + 1]; ++row) {
+                    for (auto const& entry : oldMatrix.getRow(row)) {
+                        builder.addNextValue(row, entry.getColumn(), convertReward<OutputValueType>(entry.getValue()));
+                    }
+                }
+            }
+            transitionRewards = builder.build();
+        }
+        return storm::models::sparse::StandardRewardModel<OutputValueType>(std::move(stateRewards), std::move(stateActionRewards),
+                                                                           std::move(transitionRewards));
+    }
+
+    /*!
      * Assembles the final model around a freshly built transition matrix, carrying over state labeling,
-     * choice labeling, state valuations and choice origins from the original model where present. Prints a
+     * reward models, choice labeling, state valuations and choice origins from the original model where present. Prints a
      * fingerprint hash of the output transition probabilities before handing the matrix off.
      */
     template<typename OutputValueType>
@@ -492,7 +550,9 @@ class LearningHelper {
 
         storm::storage::sparse::ModelComponents<OutputValueType, storm::models::sparse::StandardRewardModel<OutputValueType>> components(
             std::move(matrix), model.getStateLabeling());
-        // TODO: Carry over reward models; this needs a conversion from ValueType rewards to OutputValueType rewards.
+        for (auto const& [name, rewardModel] : model.getRewardModels()) {
+            components.rewardModels.emplace(name, convertRewardModel<OutputValueType>(rewardModel, !model.isNondeterministicModel()));
+        }
 
         if (model.hasChoiceLabeling()) {
             components.choiceLabeling = storm::models::sparse::ChoiceLabeling(model.getChoiceLabeling());
