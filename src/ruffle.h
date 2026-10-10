@@ -43,7 +43,8 @@
  *  - an interval model (IMDP) learned by sampling the input as a black-box system and computing
  *    Clopper-Pearson confidence intervals on the observed transition probabilities, or built
  *    deterministically by widening each concrete probability into an interval of a fixed width;
- *  - or a perturbed point model obtained by resampling the real distribution of each choice.
+ *  - or a perturbed point model obtained by resampling the real distribution of each choice or by adding
+ *    noise to it.
  * See the free functions at the end of this namespace for the entry points.
  */
 namespace ruffle {
@@ -689,6 +690,110 @@ class LearningHelper {
 
         return finalizeModel(model, builder.build());
     }
+
+    /*!
+     * Builds a model of the same value type as the input in which noise is added to the transition
+     * probabilities of each choice, following the perturbation of large models in the experiments of
+     * Kiefer and Tang (Approximate Bisimulation Minimisation, FSTTCS 2021): for each choice, an error is
+     * drawn that is at most `delta` with probability `1 - lambda` (uniformly distributed in [0, delta]) and
+     * `min(2 * delta, 1)` otherwise. Half of the error is added to randomly chosen successors and half of
+     * it is subtracted from randomly chosen successors. The L1 distance between the real and the perturbed
+     * distribution is therefore at most the error (and smaller if a successor is chosen for both).
+     * Choices with a single successor are kept as they are. No transition is added or removed.
+     */
+    static std::shared_ptr<storm::models::sparse::Model<ValueType>> buildPerturbedDistributionModel(storm::models::sparse::Model<ValueType> const& model,
+                                                                                                    double delta, double lambda, uint64_t const seed) {
+        if (!(delta > 0.0)) {
+            throw std::invalid_argument("Maximum L1 distance must be positive.");
+        }
+        if (!(lambda >= 0.0 && lambda <= 1.0)) {
+            throw std::invalid_argument("The probability to exceed the maximum L1 distance must be in the interval [0, 1].");
+        }
+
+        auto const& oldMatrix = model.getTransitionMatrix();
+        uint64_t const numChoices = oldMatrix.getRowCount();
+        // The perturbed probabilities of each choice, in the order of the entries of its row.
+        std::vector<std::vector<ValueType>> perturbed(numChoices);
+        std::vector<double> l1Distances(numChoices, 0.0);
+
+        parallelForEachChoice(numChoices, [&](uint64_t currentChoice) {
+            auto& probabilities = perturbed[currentChoice];
+            std::vector<uint64_t> support;  // indices of the entries with nonzero probability
+            for (auto const& entry : oldMatrix.getRow(currentChoice)) {
+                if (!storm::utility::isZero(entry.getValue())) {
+                    support.push_back(probabilities.size());
+                }
+                probabilities.push_back(entry.getValue());
+            }
+            if (support.size() <= 1) {
+                return;
+            }
+
+            std::mt19937_64 rng = createChoiceRng(seed, currentChoice);
+            std::uniform_real_distribution<double> uniformDistribution(0.0, 1.0);
+            std::uniform_int_distribution<uint64_t> successorDistribution(0, support.size() - 1);
+            double const error = uniformDistribution(rng) <= 1.0 - lambda ? uniformDistribution(rng) * delta : std::min(2.0 * delta, 1.0);
+
+            // Moves error/2 of probability mass in the given direction, in random portions to random successors.
+            // A portion is all that remains once as many portions as there are successors have been tried. Portions
+            // that would make a probability exceed one or reach zero are reduced, which keeps all transitions.
+            auto move = [&](bool increase) {
+                ValueType remaining = storm::utility::convertNumber<ValueType>(error / 2.0);
+                uint64_t const maxAttempts = 100 * support.size();
+                for (uint64_t attempt = 1; attempt <= maxAttempts && remaining > zero; ++attempt) {
+                    auto& probability = probabilities[support[successorDistribution(rng)]];
+                    ValueType portion = attempt < support.size() ? remaining * storm::utility::convertNumber<ValueType>(uniformDistribution(rng)) : remaining;
+                    if (increase) {
+                        portion = std::min<ValueType>(portion, one - probability);
+                        probability += portion;
+                    } else {
+                        portion = std::min<ValueType>(portion, probability / two);
+                        probability -= portion;
+                    }
+                    remaining -= portion;
+                }
+            };
+            move(true);
+            move(false);
+
+            // Compensate rounding errors (if any) at the largest probability so that the distribution sums up to one.
+            ValueType sum = zero;
+            for (auto const& probability : probabilities) {
+                sum += probability;
+            }
+            *std::max_element(probabilities.begin(), probabilities.end()) += one - sum;
+
+            uint64_t index = 0;
+            for (auto const& entry : oldMatrix.getRow(currentChoice)) {
+                l1Distances[currentChoice] += std::abs(storm::utility::convertNumber<double>(ValueType(entry.getValue() - probabilities[index])));
+                ++index;
+            }
+        });
+
+        bool const isDeterministicModel = !model.isNondeterministicModel();
+        auto builder = createMatrixBuilder<ValueType>(oldMatrix, isDeterministicModel);
+        auto const& stateChoiceIndices = oldMatrix.getRowGroupIndices();
+        for (std::size_t s = 0; s < model.getNumberOfStates(); ++s) {
+            if (!isDeterministicModel) {
+                builder.newRowGroup(stateChoiceIndices[s]);
+            }
+            for (auto currentChoice = stateChoiceIndices[s]; currentChoice < stateChoiceIndices[s + 1]; ++currentChoice) {
+                uint64_t index = 0;
+                for (auto const& entry : oldMatrix.getRow(currentChoice)) {
+                    builder.addNextValue(currentChoice, entry.getColumn(), perturbed[currentChoice][index]);
+                    ++index;
+                }
+            }
+        }
+
+        // The tolerance accounts for rounding errors when computing the distances.
+        uint64_t const numExceeding = std::count_if(l1Distances.begin(), l1Distances.end(), [&](double distance) { return distance > delta * (1.0 + 1e-9); });
+        RUFFLE_LOG("Maximum L1 distance between the real and the perturbed distribution over all choices: "
+                   << (numChoices == 0 ? 0.0 : *std::max_element(l1Distances.begin(), l1Distances.end())) << ".\n");
+        RUFFLE_LOG("The L1 distance exceeds delta for " << numExceeding << " of " << numChoices << " choices.\n");
+
+        return finalizeModel(model, builder.build());
+    }
 };
 
 /*!
@@ -786,6 +891,26 @@ std::shared_ptr<storm::models::sparse::Model<ValueType>> sampleModelDistribution
     RUFFLE_LOG("Sampling from the real distribution per state-action pair until the L1 distance is at most delta=" << delta << ".\n");
     return LearningHelper<ValueType>::buildSampledDistributionModel(
         model, LearningHelper<ValueType>::sampleUntilEmpiricalL1Distance(model.getTransitionMatrix(), delta, seed, ensureFullCoverage));
+}
+
+/*!
+ * Adds noise to the transition probabilities of each choice, as in the experiments of Kiefer and Tang
+ * (Approximate Bisimulation Minimisation, FSTTCS 2021) for large models. No sampling of successors is
+ * involved, so the effort does not depend on `delta`.
+ * @param model The concrete input model to perturb.
+ * @param delta L1 distance between the real and the perturbed distribution of a choice that is exceeded
+ * with probability at most `lambda` (the error parameter epsilon of the paper).
+ * @param lambda Probability with which the L1 distance of a choice is 2 * delta instead (the error bound
+ * delta of the paper).
+ * @param seed Seed for the random number generator.
+ * @return A perturbed point model of the same value type as `model`.
+ */
+template<typename ValueType>
+std::shared_ptr<storm::models::sparse::Model<ValueType>> perturbModelDistribution(storm::models::sparse::Model<ValueType> const& model, double delta,
+                                                                                  double lambda, uint64_t seed) {
+    RUFFLE_LOG("Perturbing the distribution of each state-action pair such that the L1 distance is at most delta=" << delta << " with probability "
+                                                                                                                    << (1.0 - lambda) << ".\n");
+    return LearningHelper<ValueType>::buildPerturbedDistributionModel(model, delta, lambda, seed);
 }
 
 }  // namespace ruffle

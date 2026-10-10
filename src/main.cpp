@@ -72,6 +72,14 @@ void printHelp(char const* programName) {
               << "                          --delta <double>    Sample until the L1 distance to the real distribution\n"
               << "                                              is at most this.\n"
               << "                          --full-coverage, --seed <uint64>   Same as for learn-interval.\n\n"
+              << "  perturb-distribution  Add noise to the distribution of each state-action pair, as Kiefer and Tang\n"
+              << "                        (Approximate Bisimulation Minimisation, FSTTCS 2021) do for large models:\n"
+              << "                        with probability 1 - lambda, the L1 distance to the real distribution is at\n"
+              << "                        most delta, and otherwise it is 2 * delta. No sampling of successors, so\n"
+              << "                        this is fast even for small delta. Transitions are neither added nor removed.\n"
+              << "                          --delta <double>    Required. L1 distance (epsilon in the paper).\n"
+              << "                          --lambda <double>   Probability to exceed it (delta in the paper). Default: 0.01.\n"
+              << "                          --seed <uint64>     Same as for learn-interval.\n\n"
               << "  --help                Print this help and exit.\n";
 }
 
@@ -138,8 +146,10 @@ std::optional<Options> parseOptions(int argc, char* argv[]) {
     if (options.mode.empty()) {
         throw std::runtime_error("Missing required option --mode.");
     }
-    if (options.mode != "learn-interval" && options.mode != "widen-interval" && options.mode != "sample-distribution") {
-        throw std::runtime_error("Unknown mode '" + options.mode + "'. Supported modes: learn-interval, widen-interval, sample-distribution.");
+    if (options.mode != "learn-interval" && options.mode != "widen-interval" && options.mode != "sample-distribution" &&
+        options.mode != "perturb-distribution") {
+        throw std::runtime_error("Unknown mode '" + options.mode +
+                                 "'. Supported modes: learn-interval, widen-interval, sample-distribution, perturb-distribution.");
     }
     if (options.mode == "widen-interval") {
         if (!options.delta.has_value()) {
@@ -150,6 +160,16 @@ std::optional<Options> parseOptions(int argc, char* argv[]) {
         }
         if (options.fullCoverage) {
             throw std::runtime_error("Mode 'widen-interval' does not sample the model, so --full-coverage has no effect.");
+        }
+    } else if (options.mode == "perturb-distribution") {
+        if (!options.delta.has_value()) {
+            throw std::runtime_error("Mode 'perturb-distribution' requires --delta.");
+        }
+        if (options.samples.has_value() || options.fullCoverage) {
+            throw std::runtime_error("Mode 'perturb-distribution' does not sample successors, so it does not use --samples and --full-coverage.");
+        }
+        if (options.epsilon.has_value()) {
+            throw std::runtime_error("Mode 'perturb-distribution' does not support --epsilon; the L1 distance is given by --delta.");
         }
     } else {
         if (options.samples.has_value() && options.delta.has_value()) {
@@ -233,6 +253,10 @@ void runMode(storm::models::sparse::Model<ValueType> const& model, Options const
         std::optional<ValueType> const epsilon = options.epsilon;
         auto widenedModel = ruffle::widenModelIntervals<ValueType>(model, options.delta.value(), epsilon);
         exportModel(widenedModel, options.outputFile);
+    } else if (options.mode == "perturb-distribution") {
+        uint64_t const seed = resolveSeed(options);
+        auto perturbedModel = ruffle::perturbModelDistribution<ValueType>(model, options.delta.value(), options.lambda, seed);
+        exportModel(perturbedModel, options.outputFile);
     } else {
         uint64_t const seed = resolveSeed(options);
         auto sampledModel = options.samples.has_value()

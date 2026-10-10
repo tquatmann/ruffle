@@ -62,6 +62,20 @@ use different formats:
   Also supports:
   - `--full-coverage` and `--seed <uint64>` — same as for `learn-interval` above.
 
+- **`perturb-distribution`** — adds noise to the distribution of each state-action pair (a perturbed
+  point model, not an interval model), following the perturbation of large models in the experiments
+  of Kiefer and Tang, *Approximate Bisimulation Minimisation* (FSTTCS 2021): for each state-action
+  pair, an error is drawn that is uniformly distributed in `[0, delta]` with probability `1 - lambda`
+  and `min(2 * delta, 1)` otherwise. Half of it is added to randomly chosen successors and half of it
+  is subtracted from randomly chosen successors, so the L1 distance to the real distribution is at
+  most the error. Transitions are neither added nor removed, and state-action pairs with a single
+  successor are kept. In contrast to `sample-distribution`, no successors are sampled, so the runtime
+  does not depend on `delta`.
+  - `--delta <double>` — required; the L1 distance (called epsilon in the paper).
+  - `--lambda <double>` — the probability with which the L1 distance is `2 * delta` instead (called
+    delta in the paper; default: 0.01).
+  - `--seed <uint64>` — same as for `learn-interval` above.
+
 Run `./build/bin/ruffle --help` for the full option list.
 
 ### Examples
@@ -69,5 +83,6 @@ Run `./build/bin/ruffle --help` for the full option list.
 ./build/bin/ruffle --input model.umb --output model-learned.umb --mode learn-interval --samples 10000 --seed 42
 ./build/bin/ruffle --input model.umb --output model-widened.umb --mode widen-interval --delta 0.1
 ./build/bin/ruffle --input model.umb --output model-perturbed.umb --mode sample-distribution --samples 10000 --seed 42
+./build/bin/ruffle --input model.umb --output model-perturbed.umb --mode perturb-distribution --delta 0.0001 --seed 42
 ./build/bin/ruffle --input model.drn --output model-widened.drn.gz --mode widen-interval --delta 0.1
 ```
